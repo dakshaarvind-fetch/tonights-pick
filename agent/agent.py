@@ -19,6 +19,9 @@ import os
 import asyncio
 from typing import Any
 
+from dotenv import load_dotenv
+load_dotenv()
+
 from uagents import Agent, Context, Protocol
 from uagents.setup import fund_agent_if_low
 
@@ -44,9 +47,9 @@ from tonights_pick_mcp.tools import (
 # Config
 # ---------------------------------------------------------------------------
 
-ASI1_API_KEY = os.environ.get("ASI1_API_KEY", "")
+ASI1_API_KEY = os.environ.get("ASI_ONE_API_KEY", "")
 ASI1_BASE_URL = "https://api.asi1.ai/v1"
-ASI1_MODEL = "asi1-mini"
+ASI1_MODEL = "asi1"
 AGENT_SEED = os.environ.get("AGENT_SEED", "tonights-pick-agent-seed-v1")
 AGENT_PORT = int(os.environ.get("AGENT_PORT", 8001))
 
@@ -198,6 +201,27 @@ TOOL_SCHEMAS: list[dict] = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "finish",
+            "description": (
+                "Call this when you have gathered all the information you need and are ready "
+                "to send the final movie recommendation to the user. Pass your complete reply "
+                "as the 'reply' argument."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "reply": {
+                        "type": "string",
+                        "description": "The final recommendation message to send to the user.",
+                    }
+                },
+                "required": ["reply"],
+            },
+        },
+    },
 ]
 
 # ---------------------------------------------------------------------------
@@ -211,12 +235,16 @@ and present them grouped by vibe with a one-line "why this for you tonight" for 
 
 Rules:
 - Keep tool calls focused. Resolve reference titles to IDs first, then use those IDs.
-- Always call check_watch_providers on your final candidates (pass all IDs at once).
+- Use at most 2-3 discovery calls (resolve_mood, get_similar, search_by_keyword), then stop searching.
+- Call check_watch_providers ONCE on all your candidates at the same time (pass all IDs in one call).
+- Once you have confirmed at least 3 movies with streaming availability, call finish immediately.
+- Do NOT keep searching for more movies after you have 3-4 good candidates.
 - Only recommend movies that are available on at least one streaming service.
 - Group picks by sub-vibe (e.g. "If you want slow-burn tension → X", "For relentless edge → Y").
-- Include runtime in your reply (get_movie_details if needed).
+- Include runtime in your reply (get_movie_details if needed, but only for your final picks).
 - Be concise — the final reply should be 4-8 lines, not an essay.
 - Never recommend a movie the user has already rejected.
+- You MUST call the finish tool to send your reply. Never call more than 6 tools total.
 """
 
 # ---------------------------------------------------------------------------
@@ -274,24 +302,21 @@ async def run_tool_loop(messages: list[dict], rejections: list) -> str:
     }
     loop_messages = [system_msg] + messages
 
-    max_iterations = 8  # safety cap
+    max_iterations = 15  # safety cap
     for _ in range(max_iterations):
         response = await asi1_client.chat.completions.create(
             model=ASI1_MODEL,
             messages=loop_messages,
             tools=TOOL_SCHEMAS,
-            tool_choice="auto",
+            tool_choice="required",
         )
         choice = response.choices[0]
-
-        # If the model returned a text reply, we're done
-        if choice.finish_reason == "stop" or choice.message.content:
-            return choice.message.content or ""
 
         # Process tool calls
         tool_calls = choice.message.tool_calls or []
         if not tool_calls:
-            return choice.message.content or ""
+            # No tool calls and no finish — return whatever content we have
+            return choice.message.content or "Sorry, I ran into trouble finding good picks. Please try again."
 
         # Add the assistant's tool-call message to history
         loop_messages.append({
@@ -311,6 +336,11 @@ async def run_tool_loop(messages: list[dict], rejections: list) -> str:
         for tc in tool_calls:
             fn_name = tc.function.name
             fn_args = json.loads(tc.function.arguments)
+
+            # finish tool — model is done, return its reply
+            if fn_name == "finish":
+                return fn_args.get("reply", "")
+
             fn = TOOL_FUNCTIONS.get(fn_name)
             if fn is None:
                 result = json.dumps({"error": f"Unknown tool: {fn_name}"})
