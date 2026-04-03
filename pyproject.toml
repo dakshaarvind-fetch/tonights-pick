@@ -1,0 +1,33 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "tonights-pick"
+version = "0.1.0"
+description = "Conversational movie recommendation agent — TMDB MCP server + Fetch.ai uAgent"
+requires-python = ">=3.11"
+dependencies = [
+    "fastmcp>=0.1.0",
+    "httpx>=0.27.0",
+    "pydantic>=2.0.0",
+    "python-dotenv>=1.0.0",
+    "uagents>=0.14.0",
+    "openai>=1.30.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0.0",
+    "pytest-asyncio>=0.23.0",
+    "google-adk>=0.1.0",
+]
+
+[project.scripts]
+tonights-pick-mcp = "tonights_pick_mcp.server:main"
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+
+[tool.hatch.build.targets.wheel]
+packages = ["tonights_pick_mcp"]
