@@ -1,0 +1,19 @@
+services:
+  agent:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: tonights-pick-agent
+    restart: unless-stopped
+    ports:
+      - "8001:8001"
+    env_file:
+      - .env
+    environment:
+      - AGENT_PORT=8001
+    networks:
+      - agent-network
+
+networks:
+  agent-network:
+    driver: bridge
