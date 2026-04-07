@@ -24,6 +24,15 @@ load_dotenv()
 
 from uagents import Agent, Context, Protocol
 from uagents.setup import fund_agent_if_low
+from uagents_core.contrib.protocols.chat import (
+    AgentContent,
+    ChatAcknowledgement,
+    ChatMessage,
+    EndSessionContent,
+    StartSessionContent,
+    TextContent,
+    chat_protocol_spec,
+)
 
 # ASI1 client — OpenAI-compatible
 from openai import AsyncOpenAI
@@ -260,7 +269,7 @@ agent = Agent(
 
 fund_agent_if_low(agent.wallet.address())
 
-chat_proto = Protocol("ChatProtocol")
+chat_proto = Protocol(spec=chat_protocol_spec)
 
 
 # ---------------------------------------------------------------------------
@@ -416,31 +425,52 @@ def _extract_intake(text: str, state: dict) -> dict:
 # Message handler
 # ---------------------------------------------------------------------------
 
-from uagents import Model as UModel
+from datetime import datetime, timezone
+from uuid import uuid4
 
 
-class ChatMessage(UModel):
-    session_id: str
-    text: str
+def _make_chat_message(text: str) -> ChatMessage:
+    return ChatMessage(
+        timestamp=datetime.now(timezone.utc),
+        msg_id=uuid4(),
+        content=[TextContent(type="text", text=text)],
+    )
 
 
-class ChatAcknowledgement(UModel):
-    session_id: str
-    status: str = "ok"
+@chat_proto.on_message(ChatAcknowledgement)
+async def on_ack(ctx: Context, sender: str, msg: ChatAcknowledgement) -> None:
+    ctx.logger.info(f"Acknowledgement from {sender} for {msg.acknowledged_msg_id}")
 
 
-@chat_proto.on_message(model=ChatMessage, replies={ChatAcknowledgement})
+@chat_proto.on_message(ChatMessage)
 async def on_chat_message(ctx: Context, sender: str, msg: ChatMessage) -> None:
     # Acknowledge immediately
-    await ctx.send(sender, ChatAcknowledgement(session_id=msg.session_id))
+    await ctx.send(
+        sender,
+        ChatAcknowledgement(
+            timestamp=datetime.now(timezone.utc),
+            acknowledged_msg_id=msg.msg_id,
+        ),
+    )
+
+    # Handle start-session silently
+    if any(isinstance(item, StartSessionContent) for item in msg.content):
+        ctx.logger.info(f"Session started by {sender}")
+
+    # Extract text from message
+    user_text = " ".join(
+        item.text for item in msg.content if isinstance(item, TextContent)
+    ).strip()
+    if not user_text:
+        return
 
     state = _load_state(ctx)
 
     # Append user turn to history
-    state["history"].append({"role": "user", "content": msg.text})
+    state["history"].append({"role": "user", "content": user_text})
 
     # Try to extract intake fields from this message
-    state = _extract_intake(msg.text, state)
+    state = _extract_intake(user_text, state)
 
     if not _intake_complete(state):
         # Ask the one clarifying question
@@ -450,8 +480,7 @@ async def on_chat_message(ctx: Context, sender: str, msg: ChatMessage) -> None:
         )
         state["history"].append({"role": "assistant", "content": follow_up})
         _save_state(ctx, state)
-        reply_msg = ChatMessage(session_id=msg.session_id, text=follow_up)
-        await ctx.send(sender, reply_msg)
+        await ctx.send(sender, _make_chat_message(follow_up))
         return
 
     # Intake complete — run the tool-use loop
@@ -459,7 +488,7 @@ async def on_chat_message(ctx: Context, sender: str, msg: ChatMessage) -> None:
     state["history"].append({"role": "assistant", "content": reply_text})
     _save_state(ctx, state)
 
-    await ctx.send(sender, ChatMessage(session_id=msg.session_id, text=reply_text))
+    await ctx.send(sender, _make_chat_message(reply_text))
 
 
 agent.include(chat_proto)
