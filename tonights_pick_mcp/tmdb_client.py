@@ -63,6 +63,34 @@ async def search_by_keyword_raw(keyword: str) -> dict[str, Any]:
     return await _get("/search/keyword", {"query": keyword})
 
 
+# ---------------------------------------------------------------------------
+# TV endpoints
+# ---------------------------------------------------------------------------
+
+async def search_tv_raw(query: str, page: int = 1) -> dict[str, Any]:
+    return await _get("/search/tv", {"query": query, "page": page})
+
+
+async def get_tv_details_raw(tv_id: int) -> dict[str, Any]:
+    return await _get(f"/tv/{tv_id}")
+
+
+async def get_similar_tv_raw(tv_id: int, page: int = 1) -> dict[str, Any]:
+    return await _get(f"/tv/{tv_id}/similar", {"page": page})
+
+
+async def get_tv_recommendations_raw(tv_id: int, page: int = 1) -> dict[str, Any]:
+    return await _get(f"/tv/{tv_id}/recommendations", {"page": page})
+
+
+async def discover_tv_raw(params: dict[str, Any]) -> dict[str, Any]:
+    return await _get("/discover/tv", params)
+
+
+async def get_tv_watch_providers_raw(tv_id: int) -> dict[str, Any]:
+    return await _get(f"/tv/{tv_id}/watch/providers")
+
+
 async def aclose() -> None:
     """Close the shared HTTP client."""
     global _client

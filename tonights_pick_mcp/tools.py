@@ -19,12 +19,45 @@ from .tmdb_client import (
     discover_movies_raw,
     search_by_keyword_raw,
     get_movie_details_raw,
+    search_tv_raw,
+    get_tv_details_raw,
+    get_similar_tv_raw,
+    discover_tv_raw,
 )
-from .models import MovieResult, SearchResponse
+from .models import MovieResult, TVResult, SearchResponse
 from .mood_map import resolve_vibe
 from .batch import batch_watch_providers as _batch_watch_providers
+from .batch import batch_tv_watch_providers as _batch_tv_watch_providers
 
 mcp = FastMCP("tonights-pick-mcp")
+
+
+def _tv_from_dict(d: dict) -> TVResult:
+    return TVResult(
+        id=d["id"],
+        name=d.get("name", ""),
+        overview=d.get("overview", ""),
+        first_air_date=d.get("first_air_date", ""),
+        vote_average=d.get("vote_average", 0.0),
+        genre_ids=d.get("genre_ids", []),
+        popularity=d.get("popularity", 0.0),
+    )
+
+
+def _format_tv(shows: list[TVResult], limit: int = 10) -> str:
+    return json.dumps(
+        [
+            {
+                "id": s.id,
+                "title": s.name,
+                "year": s.year,
+                "rating": round(s.vote_average, 1),
+                "overview": s.overview[:200],
+            }
+            for s in shows[:limit]
+        ],
+        indent=2,
+    )
 
 
 def _movie_from_dict(d: dict) -> MovieResult:
@@ -92,13 +125,14 @@ async def get_recommendations(movie_id: int, limit: int = 10) -> str:
 
 
 @mcp.tool()
-async def resolve_mood(vibe: str, limit: int = 10) -> str:
+async def resolve_mood(vibe: str, limit: int = 10, max_runtime: Optional[int] = None) -> str:
     """Discover movies that match a mood or vibe description.
 
     Supported vibes include: on-edge, slow-burn, dark, intense, feel-good,
     romantic, cosy, mind-bending, scary, funny, action-packed, tearjerker.
     Partial matches and common aliases are handled automatically.
 
+    max_runtime: optional upper bound on runtime in minutes (e.g. 90).
     Returns up to `limit` movies sorted by the vibe's preferred signal.
     """
     mapping = resolve_vibe(vibe)
@@ -110,6 +144,8 @@ async def resolve_mood(vibe: str, limit: int = 10) -> str:
         "vote_count.gte": 200,
         "page": 1,
     }
+    if max_runtime:
+        params["with_runtime.lte"] = max_runtime
     data = await discover_movies_raw(params)
     movies = [_movie_from_dict(d) for d in data.get("results", [])]
     return _format_movies(movies, limit)
@@ -177,6 +213,111 @@ async def get_movie_details(movie_id: int) -> str:
         "overview": data.get("overview", ""),
     }
     return json.dumps(result, indent=2)
+
+
+# ---------------------------------------------------------------------------
+# TV tools
+# ---------------------------------------------------------------------------
+
+# TV genre IDs differ from movie genre IDs on TMDB
+_TV_VIBE_MAP: dict[str, dict] = {
+    "on-edge":       {"genres": [9648, 80],    "sort": "vote_average.desc"},   # mystery, crime
+    "slow-burn":     {"genres": [18, 9648],    "sort": "vote_average.desc"},   # drama, mystery
+    "dark":          {"genres": [80, 18],      "sort": "vote_average.desc"},   # crime, drama
+    "intense":       {"genres": [10759, 18],   "sort": "popularity.desc"},     # action&adventure, drama
+    "feel-good":     {"genres": [35, 10751],   "sort": "popularity.desc"},     # comedy, family
+    "romantic":      {"genres": [18, 35],      "sort": "vote_average.desc"},   # drama, comedy
+    "cosy":          {"genres": [35, 10751],   "sort": "popularity.desc"},     # comedy, family
+    "mind-bending":  {"genres": [10765, 9648], "sort": "vote_average.desc"},   # sci-fi & fantasy, mystery
+    "scary":         {"genres": [10765, 9648], "sort": "popularity.desc"},     # sci-fi & fantasy, mystery
+    "funny":         {"genres": [35],          "sort": "popularity.desc"},     # comedy
+    "action-packed": {"genres": [10759, 10765],"sort": "popularity.desc"},     # action&adventure, sci-fi
+    "tearjerker":    {"genres": [18],          "sort": "vote_average.desc"},   # drama
+}
+
+
+@mcp.tool()
+async def search_tv(query: str, limit: int = 5) -> str:
+    """Search TMDB for TV shows matching a title or partial title.
+
+    Returns up to `limit` results with id, title, year, rating, and overview.
+    Use this to resolve a show title to its TMDB ID before calling get_similar_tv.
+    """
+    data = await search_tv_raw(query)
+    shows = [_tv_from_dict(d) for d in data.get("results", [])]
+    return _format_tv(shows, limit)
+
+
+@mcp.tool()
+async def get_similar_tv(tv_id: int, limit: int = 10) -> str:
+    """Get TV shows similar to a given TMDB show ID."""
+    data = await get_similar_tv_raw(tv_id)
+    shows = [_tv_from_dict(d) for d in data.get("results", [])]
+    return _format_tv(shows, limit)
+
+
+@mcp.tool()
+async def get_tv_details(tv_id: int) -> str:
+    """Get full details for a TV show by TMDB ID.
+
+    Returns title, year, number of seasons, episode runtime, genres, overview.
+    """
+    data = await get_tv_details_raw(tv_id)
+    genres = [g["name"] for g in data.get("genres", [])]
+    runtimes = data.get("episode_run_time", [])
+    result = {
+        "id": data["id"],
+        "title": data.get("name", ""),
+        "year": (data.get("first_air_date", "") or "")[:4],
+        "seasons": data.get("number_of_seasons"),
+        "episodes": data.get("number_of_episodes"),
+        "episode_runtime_min": runtimes[0] if runtimes else None,
+        "rating": round(data.get("vote_average", 0.0), 1),
+        "genres": genres,
+        "overview": data.get("overview", ""),
+        "status": data.get("status", ""),
+    }
+    return json.dumps(result, indent=2)
+
+
+@mcp.tool()
+async def resolve_mood_tv(vibe: str, limit: int = 10) -> str:
+    """Discover TV shows that match a mood or vibe.
+
+    Supported vibes: on-edge, slow-burn, dark, intense, feel-good,
+    romantic, cosy, mind-bending, scary, funny, action-packed, tearjerker.
+    """
+    key = vibe.lower().strip()
+    mapping = _TV_VIBE_MAP.get(key, {"genres": [18], "sort": "popularity.desc"})
+    genre_str = ",".join(str(g) for g in mapping["genres"])
+
+    params: dict = {
+        "with_genres": genre_str,
+        "sort_by": mapping["sort"],
+        "vote_count.gte": 100,
+        "page": 1,
+    }
+    data = await discover_tv_raw(params)
+    shows = [_tv_from_dict(d) for d in data.get("results", [])]
+    return _format_tv(shows, limit)
+
+
+@mcp.tool()
+async def check_tv_watch_providers(tv_ids: list[int], country: str = "US") -> str:
+    """Check streaming availability for a list of TV show IDs.
+
+    country: ISO 3166-1 alpha-2 code, e.g. "US", "GB".
+    Returns streaming, rent, and buy options per show.
+    """
+    results = await _batch_tv_watch_providers(tv_ids, country)
+    output = []
+    for r in results:
+        entry: dict = {"tv_id": r.movie_id, "streaming": r.streaming_names}
+        if not r.streaming_names:
+            entry["rent"] = [p.provider_name for p in r.rent]
+            entry["buy"] = [p.provider_name for p in r.buy]
+        output.append(entry)
+    return json.dumps(output, indent=2)
 
 
 @mcp.tool()
