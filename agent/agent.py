@@ -357,6 +357,14 @@ TV_TOOL_SCHEMAS: list[dict] = [
 # System prompts
 # ---------------------------------------------------------------------------
 
+_FORMAT_RULES = """
+Formatting rules (follow exactly):
+- Each pick on its own line as a bullet point, format: For [vibe label] -> [Title] ([runtime]) — [one-line reason]. Stream on: [service]
+- Bold the vibe label (e.g. **For slow-burn dread**), Italisize the movie name (e.g. *The Matrix*), everything after the colon is plain text.
+- Do NOT use markdown headings (#, ##, ###). Do NOT bold the movie title or the full line.
+- Never list more than 4 picks. Group by vibe if multiple vibes.
+"""
+
 _MOVIE_SYSTEM_PROMPT = """You are Tonight's Pick — a conversational movie recommendation agent.
 
 Your goal: given a user's mood and viewing context, find 3-4 streaming-ready movies
@@ -367,12 +375,11 @@ Rules:
 - Use at most 2-3 discovery calls (resolve_mood, get_similar, search_by_keyword), then stop.
 - Call check_watch_providers ONCE on all candidates together (pass all IDs in one call).
 - Only recommend movies available on at least one streaming service.
-- Group picks by sub-vibe (e.g. "For relentless edge → X", "For slow-burn tension → Y").
 - Include runtime in your reply (use get_movie_details if needed, only for final picks).
 - Be concise — the final reply should be 4-8 lines.
 - Never recommend a movie the user has already rejected or already seen.
 - You MUST call the finish tool to send your reply. Never call more than 6 tools total.
-"""
+""" + _FORMAT_RULES
 
 _TV_SYSTEM_PROMPT = """You are Tonight's Pick — a conversational TV show recommendation agent.
 
@@ -384,11 +391,11 @@ Rules:
 - Use at most 2-3 discovery calls (resolve_mood_tv, get_similar_tv), then stop.
 - Call check_tv_watch_providers ONCE on all candidates together.
 - Only recommend shows available on at least one streaming service.
-- Group picks by sub-vibe. Include number of seasons in your reply.
+- Include number of seasons in your reply.
 - Be concise — the final reply should be 4-8 lines.
 - Never recommend a show the user has already rejected or already seen.
 - You MUST call the finish tool to send your reply. Never call more than 6 tools total.
-"""
+""" + _FORMAT_RULES
 
 # ---------------------------------------------------------------------------
 # uAgent setup
@@ -410,6 +417,18 @@ chat_proto = Protocol(spec=chat_protocol_spec)
 # Storage helpers
 # ---------------------------------------------------------------------------
 
+FEATURE_HINT = """
+---
+You can also:
+- Save a pick -> "save [title]"
+- View your watchlist -> "show my watchlist"
+- Skip titles you've seen -> "I've already seen [title]" or "mark [title] as seen"
+- Filter by runtime -> "under 90 minutes" or "only 2 hours"
+- Switch to TV -> "something to binge" or mention a series
+- Mixed moods -> "I want dark, they want romantic"
+"""
+
+
 def _load_state(ctx: Context) -> dict:
     return {
         "vibe": ctx.storage.get("vibe") or "",
@@ -419,10 +438,11 @@ def _load_state(ctx: Context) -> dict:
         "rejections": json.loads(ctx.storage.get("rejections") or "[]"),
         "history": json.loads(ctx.storage.get("history") or "[]"),
         "media_type": ctx.storage.get("media_type") or "movie",
-        "max_runtime": ctx.storage.get("max_runtime"),   # int or None
+        "max_runtime": ctx.storage.get("max_runtime"),
         "watchlist": json.loads(ctx.storage.get("watchlist") or "[]"),
         "seen_titles": json.loads(ctx.storage.get("seen_titles") or "[]"),
         "last_reply": ctx.storage.get("last_reply") or "",
+        "hint_shown": ctx.storage.get("hint_shown") == "1",
     }
 
 
@@ -439,6 +459,7 @@ def _save_state(ctx: Context, state: dict) -> None:
     ctx.storage.set("watchlist", json.dumps(state["watchlist"]))
     ctx.storage.set("seen_titles", json.dumps(state["seen_titles"]))
     ctx.storage.set("last_reply", state["last_reply"])
+    ctx.storage.set("hint_shown", "1" if state["hint_shown"] else "")
 
 
 # ---------------------------------------------------------------------------
@@ -449,19 +470,53 @@ def _detect_special_intent(text: str) -> str | None:
     """Return a special intent string or None for normal recommendation flow."""
     lower = text.lower()
 
-    watchlist_show = ["show watchlist", "my watchlist", "what's saved", "what did i save", "show my list"]
+    # --- Mark as seen (check before save to avoid conflicts) ---
+    if re.search(r"\bmark\b.+\bas\s+(?:seen|watched)\b", lower):
+        return "add_seen"
+
+    # --- Save to watchlist — specific title only ---
+    # "save [title] to my watchlist/wishlist" or just "save [title]"
+    if re.search(r"\bto\s+(my\s+|the\s+)?(watch|wish)list\b", lower):
+        return "save_watchlist"
+
+    # "save <specific title>" — starts with save + a non-pronoun word
+    if re.match(r"^save\s+(?!it\b|that\b|them\b|those\b|this\b)\w", lower):
+        return "save_watchlist"
+
+    # --- Show watchlist ---
+    watchlist_show = [
+        "show watchlist", "show my watchlist", "show wishlist", "show my wishlist",
+        "what's saved", "what did i save", "show my list",
+        "my watchlist", "my wishlist",
+    ]
     if any(p in lower for p in watchlist_show):
         return "show_watchlist"
 
-    watchlist_save = ["save it", "save that", "add to watchlist", "save for later", "add that to my list"]
-    if any(p in lower for p in watchlist_save):
-        return "save_watchlist"
-
+    # --- Show seen list ---
     seen_show = ["show seen", "what have i seen", "my seen list", "show my seen"]
     if any(p in lower for p in seen_show):
         return "show_seen"
 
     return None
+
+
+def _extract_specific_title(text: str) -> str | None:
+    """Pull a specific title out of 'save X to my watchlist/wishlist' style messages."""
+    lower = text.lower()
+    cleaned = re.sub(r"\s+to\s+(my\s+|the\s+)?(watch|wish)list.*$", "", lower).strip()
+    cleaned = re.sub(r"^(save|add)\s+", "", cleaned).strip()
+    if cleaned and cleaned not in {"it", "that", "them", "those", "this"}:
+        idx = text.lower().find(cleaned)
+        if idx != -1:
+            return text[idx: idx + len(cleaned)].strip(".,!?")
+    return None
+
+
+def _extract_mark_seen_title(text: str) -> str | None:
+    """Pull title from 'mark X as seen/watched' messages."""
+    m = re.search(r"\bmark\s+(.+?)\s+as\s+(?:seen|watched)\b", text, re.IGNORECASE)
+    if m:
+        return m.group(1).strip().strip(".,!?")
 
 
 # ---------------------------------------------------------------------------
@@ -607,17 +662,39 @@ async def run_tool_loop(messages: list[dict], state: dict) -> str:
     """Call ASI1 with tool schemas; execute tool calls until finish is called."""
     tool_functions = TV_TOOL_FUNCTIONS if state["media_type"] == "tv" else MOVIE_TOOL_FUNCTIONS
     tool_schemas = TV_TOOL_SCHEMAS if state["media_type"] == "tv" else MOVIE_TOOL_SCHEMAS
+    finish_only = [s for s in tool_schemas if s["function"]["name"] == "finish"]
 
     system_msg = {"role": "system", "content": _build_system_prompt(state)}
     loop_messages = [system_msg] + messages
 
-    for _ in range(15):
-        response = await asi1_client.chat.completions.create(
-            model=ASI1_MODEL,
-            messages=loop_messages,
-            tools=tool_schemas,
-            tool_choice="required",
-        )
+    tool_call_count = 0
+    FORCE_FINISH_AFTER = 8  # inject a nudge; hard-force finish after 10
+
+    for iteration in range(15):
+        # After threshold, force the model to call finish
+        if tool_call_count >= FORCE_FINISH_AFTER:
+            loop_messages.append({
+                "role": "user",
+                "content": (
+                    "You have gathered enough information. "
+                    "Stop searching and call finish NOW with your best picks. "
+                    "Include rent/buy options if streaming isn't available."
+                ),
+            })
+            response = await asi1_client.chat.completions.create(
+                model=ASI1_MODEL,
+                messages=loop_messages,
+                tools=finish_only,
+                tool_choice={"type": "function", "function": {"name": "finish"}},
+            )
+        else:
+            response = await asi1_client.chat.completions.create(
+                model=ASI1_MODEL,
+                messages=loop_messages,
+                tools=tool_schemas,
+                tool_choice="required",
+            )
+
         choice = response.choices[0]
         tool_calls = choice.message.tool_calls or []
 
@@ -644,6 +721,7 @@ async def run_tool_loop(messages: list[dict], state: dict) -> str:
             if fn_name == "finish":
                 return fn_args.get("reply", "")
 
+            tool_call_count += 1
             fn = tool_functions.get(fn_name)
             if fn is None:
                 result = json.dumps({"error": f"Unknown tool: {fn_name}"})
@@ -668,19 +746,31 @@ async def run_tool_loop(messages: list[dict], state: dict) -> str:
 
 def _handle_show_watchlist(state: dict) -> str:
     if not state["watchlist"]:
-        return "Your watchlist is empty. After I give you recommendations, say 'save it' to add them."
-    lines = ["Here's your watchlist:\n"]
+        return "Your watchlist is empty. After I give you recommendations, say 'save it' or 'save [title]' to add picks."
+    lines = [f"Your watchlist ({len(state['watchlist'])} title{'s' if len(state['watchlist']) != 1 else ''}):\n"]
     for i, item in enumerate(state["watchlist"], 1):
-        lines.append(f"{i}. **{item['label']}**\n{item['text']}\n")
+        lines.append(f"{i}. {item['title']}")
     return "\n".join(lines)
 
 
-def _handle_save_watchlist(state: dict) -> str:
-    if not state["last_reply"]:
-        return "Nothing to save yet — ask me for recommendations first!"
-    label = f"Saved pick #{len(state['watchlist']) + 1}"
-    state["watchlist"].append({"label": label, "text": state["last_reply"]})
-    return f"Saved to your watchlist as '{label}'. Say 'show watchlist' any time to see your saves."
+def _handle_save_watchlist(state: dict, user_text: str = "") -> str:
+    title = _extract_specific_title(user_text) if user_text else None
+    if not title:
+        return "Tell me which title to save — e.g. \"save The Dark Knight\"."
+    already = [w["title"].lower() for w in state["watchlist"]]
+    if title.lower() not in already:
+        state["watchlist"].append({"title": title})
+    current = ", ".join(w["title"] for w in state["watchlist"])
+    return f"Saved {title} to your watchlist!\n\nCurrent watchlist: {current}"
+
+
+def _handle_add_seen(state: dict, user_text: str) -> str:
+    title = _extract_mark_seen_title(user_text)
+    if title:
+        if title.lower() not in [s.lower() for s in state["seen_titles"]]:
+            state["seen_titles"].append(title)
+        return f"Got it — I'll skip **{title}** in all future recommendations."
+    return "Which title should I mark as seen? Just tell me the name."
 
 
 def _handle_show_seen(state: dict) -> str:
@@ -731,6 +821,8 @@ async def on_chat_message(ctx: Context, sender: str, msg: ChatMessage) -> None:
     user_text = " ".join(
         item.text for item in msg.content if isinstance(item, TextContent)
     ).strip()
+    # Strip leading @mentions (Agentverse includes the handle in the message text)
+    user_text = re.sub(r"^(@\w[\w.-]*\s*)+", "", user_text).strip()
     if not user_text:
         return
 
@@ -747,7 +839,14 @@ async def on_chat_message(ctx: Context, sender: str, msg: ChatMessage) -> None:
         return
 
     if intent == "save_watchlist":
-        reply = _handle_save_watchlist(state)
+        reply = _handle_save_watchlist(state, user_text)
+        state["history"].append({"role": "assistant", "content": reply})
+        _save_state(ctx, state)
+        await ctx.send(sender, _make_chat_message(reply))
+        return
+
+    if intent == "add_seen":
+        reply = _handle_add_seen(state, user_text)
         state["history"].append({"role": "assistant", "content": reply})
         _save_state(ctx, state)
         await ctx.send(sender, _make_chat_message(reply))
@@ -776,11 +875,15 @@ async def on_chat_message(ctx: Context, sender: str, msg: ChatMessage) -> None:
 
     # --- Run tool-use loop ---
     reply_text = await run_tool_loop(state["history"], state)
+    state["last_reply"] = reply_text          # store clean reply before hint
     state["history"].append({"role": "assistant", "content": reply_text})
-    state["last_reply"] = reply_text
+    outgoing = reply_text
+    if not state["hint_shown"]:
+        outgoing = reply_text + FEATURE_HINT
+        state["hint_shown"] = True
     _save_state(ctx, state)
 
-    await ctx.send(sender, _make_chat_message(reply_text))
+    await ctx.send(sender, _make_chat_message(outgoing))
 
 
 agent.include(chat_proto)
