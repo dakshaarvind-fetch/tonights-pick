@@ -687,7 +687,7 @@ def _format_picks(picks: list[dict]) -> str:
         streaming = p.get("streaming", "").strip()
         runtime_part = f" ({runtime})" if runtime else ""
         lines.append(f"• **For {vibe}** → *{title}*{runtime_part} — {reason}. Stream on: {streaming}")
-    return "\n\n".join(lines)  # double newline = proper markdown paragraph breaks
+    return "  \n".join(lines)  # two trailing spaces = markdown hard line break, no paragraph gap
 
 
 async def run_tool_loop(messages: list[dict], state: dict) -> str:
