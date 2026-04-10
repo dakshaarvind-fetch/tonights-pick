@@ -1,14 +1,14 @@
 services:
   agent:
     build:
-      context: .
-      dockerfile: Dockerfile
+      context: ..
+      dockerfile: docker/Dockerfile
     container_name: tonights-pick-agent
     restart: unless-stopped
     ports:
       - "8001:8001"
     env_file:
-      - .env
+      - ../.env
     environment:
       - AGENT_PORT=8001
     networks:

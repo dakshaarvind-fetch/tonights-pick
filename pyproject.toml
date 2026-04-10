@@ -18,16 +18,11 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = [
-    "pytest>=8.0.0",
-    "pytest-asyncio>=0.23.0",
     "google-adk>=0.1.0",
 ]
 
 [project.scripts]
 tonights-pick-mcp = "tonights_pick_mcp.server:main"
-
-[tool.pytest.ini_options]
-asyncio_mode = "auto"
 
 [tool.hatch.build.targets.wheel]
 packages = ["tonights_pick_mcp"]
