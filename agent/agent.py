@@ -231,22 +231,20 @@ MOVIE_TOOL_SCHEMAS: list[dict] = [
         "type": "function",
         "function": {
             "name": "finish",
-            "description": "Call when ready to recommend. Pass structured picks — do NOT write the formatted reply yourself.",
+            "description": "Call this when you have your final picks. Supply raw data only — no formatting.",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "picks": {
                         "type": "array",
-                        "minItems": 3,
-                        "maxItems": 4,
                         "items": {
                             "type": "object",
                             "properties": {
                                 "vibe":      {"type": "string", "description": "Short vibe label, e.g. 'slow-burn dread'"},
-                                "title":     {"type": "string", "description": "Movie title"},
-                                "runtime":   {"type": "string", "description": "e.g. '119 min'"},
-                                "reason":    {"type": "string", "description": "One-line reason why this fits tonight"},
-                                "streaming": {"type": "string", "description": "Service(s), e.g. 'Netflix' or 'Rent on Amazon'"},
+                                "title":     {"type": "string", "description": "Movie title only, no year"},
+                                "runtime":   {"type": "string", "description": "Runtime, e.g. '119 min'"},
+                                "reason":    {"type": "string", "description": "One sentence why this fits"},
+                                "streaming": {"type": "string", "description": "Streaming service name(s)"},
                             },
                             "required": ["vibe", "title", "reason", "streaming"],
                         },
@@ -356,22 +354,20 @@ TV_TOOL_SCHEMAS: list[dict] = [
         "type": "function",
         "function": {
             "name": "finish",
-            "description": "Call when ready to recommend. Pass structured picks — do NOT write the formatted reply yourself.",
+            "description": "Call this when you have your final picks. Supply raw data only — no formatting.",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "picks": {
                         "type": "array",
-                        "minItems": 3,
-                        "maxItems": 4,
                         "items": {
                             "type": "object",
                             "properties": {
                                 "vibe":      {"type": "string", "description": "Short vibe label, e.g. 'slow-burn dread'"},
-                                "title":     {"type": "string", "description": "Show title"},
-                                "runtime":   {"type": "string", "description": "e.g. '4 seasons, ~45 min/ep'"},
-                                "reason":    {"type": "string", "description": "One-line reason why this fits tonight"},
-                                "streaming": {"type": "string", "description": "Service(s), e.g. 'Netflix' or 'Rent on Amazon'"},
+                                "title":     {"type": "string", "description": "Show title only"},
+                                "runtime":   {"type": "string", "description": "e.g. '3 seasons, ~45 min/ep'"},
+                                "reason":    {"type": "string", "description": "One sentence why this fits"},
+                                "streaming": {"type": "string", "description": "Streaming service name(s)"},
                             },
                             "required": ["vibe", "title", "reason", "streaming"],
                         },
@@ -398,8 +394,8 @@ Rules:
 - Only recommend movies available on at least one streaming service.
 - Get runtime via get_movie_details for your final picks.
 - Never recommend a movie the user has already rejected or already seen.
-- You MUST call finish with a structured picks array. Never call more than 6 tools total.
-- For each pick provide: vibe label, title, runtime, one-line reason, streaming service.
+- Call finish with raw data fields (vibe, title, runtime, reason, streaming). Do not format anything.
+- Never call more than 6 tools total.
 """
 
 _TV_SYSTEM_PROMPT = """You are Tonight's Pick — a conversational TV show recommendation agent.
@@ -413,8 +409,8 @@ Rules:
 - Only recommend shows available on at least one streaming service.
 - Get seasons/runtime via get_tv_details for your final picks.
 - Never recommend a show the user has already rejected or already seen.
-- You MUST call finish with a structured picks array. Never call more than 6 tools total.
-- For each pick provide: vibe label, title, runtime (seasons + ep length), one-line reason, streaming service.
+- Call finish with raw data fields (vibe, title, runtime, reason, streaming). Do not format anything.
+- Never call more than 6 tools total.
 """
 
 # ---------------------------------------------------------------------------
@@ -432,22 +428,20 @@ fund_agent_if_low(agent.wallet.address())
 
 chat_proto = Protocol(spec=chat_protocol_spec)
 
+FEATURE_HINT = """
+
+You can also:
+- Save a pick: "save [title]"
+- View your watchlist: "show my watchlist"
+- Skip titles you've seen: "mark [title] as seen"
+- Filter by runtime: "under 90 minutes"
+- Switch to TV: "something to binge"
+- Mixed moods: "I want dark, they want romantic"
+"""
 
 # ---------------------------------------------------------------------------
 # Storage helpers
 # ---------------------------------------------------------------------------
-
-FEATURE_HINT = """
----
-You can also:
-- Save a pick -> "save [title]"
-- View your watchlist -> "show my watchlist"
-- Skip titles you've seen -> "I've already seen [title]" or "mark [title] as seen"
-- Filter by runtime -> "under 90 minutes" or "only 2 hours"
-- Switch to TV -> "something to binge" or mention a series
-- Mixed moods -> "I want dark, they want romantic"
-"""
-
 
 def _load_state(ctx: Context) -> dict:
     return {
@@ -677,7 +671,7 @@ def _build_system_prompt(state: dict) -> str:
 
 
 def _format_picks(picks: list[dict]) -> str:
-    """Format structured picks into consistent markdown — formatting never touches the LLM."""
+    """Deterministic formatting — LLM supplies raw data, we control every character."""
     lines = []
     for p in picks:
         vibe      = p.get("vibe", "").strip()
@@ -686,8 +680,8 @@ def _format_picks(picks: list[dict]) -> str:
         reason    = p.get("reason", "").strip().rstrip(".")
         streaming = p.get("streaming", "").strip()
         runtime_part = f" ({runtime})" if runtime else ""
-        lines.append(f"• **For {vibe}** → *{title}*{runtime_part} — {reason}. Stream on: {streaming}")
-    return "  \n".join(lines)  # two trailing spaces = markdown hard line break, no paragraph gap
+        lines.append(f"• **{vibe}** *{title}*{runtime_part} — {reason}. Stream on: {streaming}")
+    return "\n\n".join(lines)
 
 
 async def run_tool_loop(messages: list[dict], state: dict) -> str:
@@ -754,7 +748,7 @@ async def run_tool_loop(messages: list[dict], state: dict) -> str:
                 picks = fn_args.get("picks", [])
                 if picks:
                     return _format_picks(picks)
-                return fn_args.get("reply", "Sorry, I ran into trouble. Please try again.")
+                return "Sorry, I ran into trouble finding good picks. Please try again."
 
             tool_call_count += 1
             fn = tool_functions.get(fn_name)
@@ -912,9 +906,7 @@ async def on_chat_message(ctx: Context, sender: str, msg: ChatMessage) -> None:
     reply_text = await run_tool_loop(state["history"], state)
     state["last_reply"] = reply_text
     state["history"].append({"role": "assistant", "content": reply_text})
-    # Show hint on the first recommendation of every session (count assistant turns)
-    assistant_turns = sum(1 for m in state["history"] if m["role"] == "assistant")
-    outgoing = reply_text + FEATURE_HINT if assistant_turns == 1 else reply_text
+    outgoing = reply_text + FEATURE_HINT
     _save_state(ctx, state)
 
     await ctx.send(sender, _make_chat_message(outgoing))
