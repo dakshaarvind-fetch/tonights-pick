@@ -231,13 +231,28 @@ MOVIE_TOOL_SCHEMAS: list[dict] = [
         "type": "function",
         "function": {
             "name": "finish",
-            "description": "Call when ready to send the final recommendation to the user.",
+            "description": "Call when ready to recommend. Pass structured picks — do NOT write the formatted reply yourself.",
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "reply": {"type": "string"},
+                    "picks": {
+                        "type": "array",
+                        "minItems": 3,
+                        "maxItems": 4,
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "vibe":      {"type": "string", "description": "Short vibe label, e.g. 'slow-burn dread'"},
+                                "title":     {"type": "string", "description": "Movie title"},
+                                "runtime":   {"type": "string", "description": "e.g. '119 min'"},
+                                "reason":    {"type": "string", "description": "One-line reason why this fits tonight"},
+                                "streaming": {"type": "string", "description": "Service(s), e.g. 'Netflix' or 'Rent on Amazon'"},
+                            },
+                            "required": ["vibe", "title", "reason", "streaming"],
+                        },
+                    },
                 },
-                "required": ["reply"],
+                "required": ["picks"],
             },
         },
     },
@@ -341,13 +356,28 @@ TV_TOOL_SCHEMAS: list[dict] = [
         "type": "function",
         "function": {
             "name": "finish",
-            "description": "Call when ready to send the final TV show recommendation to the user.",
+            "description": "Call when ready to recommend. Pass structured picks — do NOT write the formatted reply yourself.",
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "reply": {"type": "string"},
+                    "picks": {
+                        "type": "array",
+                        "minItems": 3,
+                        "maxItems": 4,
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "vibe":      {"type": "string", "description": "Short vibe label, e.g. 'slow-burn dread'"},
+                                "title":     {"type": "string", "description": "Show title"},
+                                "runtime":   {"type": "string", "description": "e.g. '4 seasons, ~45 min/ep'"},
+                                "reason":    {"type": "string", "description": "One-line reason why this fits tonight"},
+                                "streaming": {"type": "string", "description": "Service(s), e.g. 'Netflix' or 'Rent on Amazon'"},
+                            },
+                            "required": ["vibe", "title", "reason", "streaming"],
+                        },
+                    },
                 },
-                "required": ["reply"],
+                "required": ["picks"],
             },
         },
     },
@@ -357,45 +387,35 @@ TV_TOOL_SCHEMAS: list[dict] = [
 # System prompts
 # ---------------------------------------------------------------------------
 
-_FORMAT_RULES = """
-Formatting rules (follow exactly):
-- Each pick on its own line as a bullet point, format: For [vibe label] -> [Title] ([runtime]) — [one-line reason]. Stream on: [service]
-- Bold the vibe label (e.g. **For slow-burn dread**), Italisize the movie name (e.g. *The Matrix*), everything after the colon is plain text.
-- Do NOT use markdown headings (#, ##, ###). Do NOT bold the movie title or the full line.
-- Never list more than 4 picks. Group by vibe if multiple vibes.
-"""
-
 _MOVIE_SYSTEM_PROMPT = """You are Tonight's Pick — a conversational movie recommendation agent.
 
-Your goal: given a user's mood and viewing context, find 3-4 streaming-ready movies
-and present them grouped by vibe with a one-line "why this for you tonight" for each.
+Your goal: find 3-4 streaming-ready movies that match the user's mood and viewing context.
 
 Rules:
-- Keep tool calls focused. Resolve reference titles to IDs first, then use those IDs.
+- Resolve reference titles to IDs first, then use those IDs.
 - Use at most 2-3 discovery calls (resolve_mood, get_similar, search_by_keyword), then stop.
-- Call check_watch_providers ONCE on all candidates together (pass all IDs in one call).
+- Call check_watch_providers ONCE on all candidates together.
 - Only recommend movies available on at least one streaming service.
-- Include runtime in your reply (use get_movie_details if needed, only for final picks).
-- Be concise — the final reply should be 4-8 lines.
+- Get runtime via get_movie_details for your final picks.
 - Never recommend a movie the user has already rejected or already seen.
-- You MUST call the finish tool to send your reply. Never call more than 6 tools total.
-""" + _FORMAT_RULES
+- You MUST call finish with a structured picks array. Never call more than 6 tools total.
+- For each pick provide: vibe label, title, runtime, one-line reason, streaming service.
+"""
 
 _TV_SYSTEM_PROMPT = """You are Tonight's Pick — a conversational TV show recommendation agent.
 
-Your goal: given a user's mood and viewing context, find 3-4 streaming-ready TV shows
-to binge and present them grouped by vibe with a one-line "why this for you tonight" for each.
+Your goal: find 3-4 streaming-ready TV shows that match the user's mood and viewing context.
 
 Rules:
-- Keep tool calls focused. Resolve reference show titles to IDs first.
+- Resolve reference show titles to IDs first.
 - Use at most 2-3 discovery calls (resolve_mood_tv, get_similar_tv), then stop.
 - Call check_tv_watch_providers ONCE on all candidates together.
 - Only recommend shows available on at least one streaming service.
-- Include number of seasons in your reply.
-- Be concise — the final reply should be 4-8 lines.
+- Get seasons/runtime via get_tv_details for your final picks.
 - Never recommend a show the user has already rejected or already seen.
-- You MUST call the finish tool to send your reply. Never call more than 6 tools total.
-""" + _FORMAT_RULES
+- You MUST call finish with a structured picks array. Never call more than 6 tools total.
+- For each pick provide: vibe label, title, runtime (seasons + ep length), one-line reason, streaming service.
+"""
 
 # ---------------------------------------------------------------------------
 # uAgent setup
@@ -442,7 +462,6 @@ def _load_state(ctx: Context) -> dict:
         "watchlist": json.loads(ctx.storage.get("watchlist") or "[]"),
         "seen_titles": json.loads(ctx.storage.get("seen_titles") or "[]"),
         "last_reply": ctx.storage.get("last_reply") or "",
-        "hint_shown": ctx.storage.get("hint_shown") == "1",
     }
 
 
@@ -459,7 +478,6 @@ def _save_state(ctx: Context, state: dict) -> None:
     ctx.storage.set("watchlist", json.dumps(state["watchlist"]))
     ctx.storage.set("seen_titles", json.dumps(state["seen_titles"]))
     ctx.storage.set("last_reply", state["last_reply"])
-    ctx.storage.set("hint_shown", "1" if state["hint_shown"] else "")
 
 
 # ---------------------------------------------------------------------------
@@ -658,6 +676,20 @@ def _build_system_prompt(state: dict) -> str:
     return base
 
 
+def _format_picks(picks: list[dict]) -> str:
+    """Format structured picks into consistent markdown — formatting never touches the LLM."""
+    lines = []
+    for p in picks:
+        vibe      = p.get("vibe", "").strip()
+        title     = p.get("title", "").strip()
+        runtime   = p.get("runtime", "").strip()
+        reason    = p.get("reason", "").strip().rstrip(".")
+        streaming = p.get("streaming", "").strip()
+        runtime_part = f" ({runtime})" if runtime else ""
+        lines.append(f"• **For {vibe}** → *{title}*{runtime_part} — {reason}. Stream on: {streaming}")
+    return "\n\n".join(lines)  # double newline = proper markdown paragraph breaks
+
+
 async def run_tool_loop(messages: list[dict], state: dict) -> str:
     """Call ASI1 with tool schemas; execute tool calls until finish is called."""
     tool_functions = TV_TOOL_FUNCTIONS if state["media_type"] == "tv" else MOVIE_TOOL_FUNCTIONS
@@ -719,7 +751,10 @@ async def run_tool_loop(messages: list[dict], state: dict) -> str:
             fn_args = json.loads(tc.function.arguments)
 
             if fn_name == "finish":
-                return fn_args.get("reply", "")
+                picks = fn_args.get("picks", [])
+                if picks:
+                    return _format_picks(picks)
+                return fn_args.get("reply", "Sorry, I ran into trouble. Please try again.")
 
             tool_call_count += 1
             fn = tool_functions.get(fn_name)
@@ -875,12 +910,11 @@ async def on_chat_message(ctx: Context, sender: str, msg: ChatMessage) -> None:
 
     # --- Run tool-use loop ---
     reply_text = await run_tool_loop(state["history"], state)
-    state["last_reply"] = reply_text          # store clean reply before hint
+    state["last_reply"] = reply_text
     state["history"].append({"role": "assistant", "content": reply_text})
-    outgoing = reply_text
-    if not state["hint_shown"]:
-        outgoing = reply_text + FEATURE_HINT
-        state["hint_shown"] = True
+    # Show hint on the first recommendation of every session (count assistant turns)
+    assistant_turns = sum(1 for m in state["history"] if m["role"] == "assistant")
+    outgoing = reply_text + FEATURE_HINT if assistant_turns == 1 else reply_text
     _save_state(ctx, state)
 
     await ctx.send(sender, _make_chat_message(outgoing))
