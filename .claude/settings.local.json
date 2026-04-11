@@ -1,0 +1,10 @@
+{
+  "permissions": {
+    "allow": [
+      "Read(//c/tmp/innovation-lab-examples/**)",
+      "Bash(cp \"c:/Users/daksh/tonights-pick/agent/agent.py\" mcp-agents/TMDB-Agent/agent.py)",
+      "Bash(ruff check:*)",
+      "Bash(ruff format:*)"
+    ]
+  }
+}
