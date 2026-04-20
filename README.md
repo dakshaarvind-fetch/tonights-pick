@@ -54,6 +54,31 @@ Claude will automatically discover all 13 tools and can call them mid-conversati
 
 ---
 
+## Persistent Storage
+
+Tonight's Pick uses **Supabase** (PostgreSQL) to persist user data across agent restarts and replicas. Without this, watchlist and seen-titles data was lost every time the agent restarted.
+
+Two tables live in the `public` schema:
+
+| Table | Purpose |
+|---|---|
+| `watchlist` | Titles the user wants to watch later (`user_id`, `title`, `added_at`) |
+| `seen_titles` | Titles the user has already seen — used to filter recommendations |
+
+Tables are auto-created on first connection (lazy init in `_get_pool`). No migration step needed.
+
+All DB access goes through `agents_shared/db.py`, which owns the connection pool (`asyncpg`, Supabase transaction pooler on port 6543).
+
+Add your Supabase connection string to `.env`:
+
+```
+DATABASE_URL=postgresql://postgres.<project-ref>:<password>@aws-0-us-east-1.pooler.supabase.com:6543/postgres
+```
+
+> `statement_cache_size=0` is required when connecting via Supabase's transaction pooler — the pool resets prepared statements between transactions and asyncpg's cache would otherwise cause errors.
+
+---
+
 ## Architecture
 
 ```
@@ -64,6 +89,10 @@ tonights_pick_mcp/
 ├── batch.py         # Concurrent watch-provider lookups via asyncio.gather
 ├── mood_map.py      # Vibe → TMDB genre IDs + sort strategy + aliases
 └── models.py        # Pydantic models for TMDB API responses
+
+agents_shared/
+├── db.py            # asyncpg pool + watchlist/seen_titles CRUD (Supabase)
+└── config.py        # Env var helpers
 ```
 
 ### Tools exposed
@@ -124,7 +153,10 @@ Create a `.env` file in the project root:
 
 ```
 TMDB_API_KEY=your_tmdb_api_key_here
+DATABASE_URL=postgresql://postgres.<project-ref>:<password>@aws-0-us-east-1.pooler.supabase.com:6543/postgres
 ```
+
+`DATABASE_URL` is only required when running the agent (watchlist/seen-titles persistence). The MCP server itself works without it.
 
 Run the MCP server:
 
