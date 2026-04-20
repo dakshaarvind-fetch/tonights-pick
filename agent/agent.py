@@ -15,11 +15,15 @@ Session state stored in ctx.storage:
   history     — JSON list of {role, content} conversation turns
   media_type  — "movie" (default) or "tv"
   max_runtime — optional int (minutes) for time-boxed discovery
-  watchlist   — JSON list of {label, text} saved recommendation sets
-  seen_titles — JSON list of movie/show titles already seen
+
+
+Persistent state (PostgreSQL via Supabase):
+  watchlist   — per-user saved titles (table: watchlist)
+  seen_titles — per-user watched titles (table: seen_titles)
 """
 
 from __future__ import annotations
+import asyncio
 import json
 import os
 import pathlib
@@ -46,6 +50,16 @@ from openai import AsyncOpenAI  # noqa: E402
 
 sys.path.insert(0, str(pathlib.Path(__file__).parent.parent))
 
+from agents_shared.health import start_health_server, mark_ready  # noqa: E402
+from agents_shared.sentry import init_sentry  # noqa: E402
+from agents_shared.db import (  # noqa: E402
+    get_watchlist,
+    add_to_watchlist,
+    get_seen_titles,
+    add_seen_title,
+    bulk_add_seen_titles,
+)
+
 from tonights_pick_mcp.tools import (  # noqa: E402
     search_movies,
     get_similar,
@@ -68,7 +82,8 @@ from tonights_pick_mcp.tools import (  # noqa: E402
 
 ASI1_API_KEY = os.environ.get("ASI_ONE_API_KEY", "")
 ASI1_BASE_URL = "https://api.asi1.ai/v1"
-ASI1_MODEL = "asi1"
+ASI1_MODEL = os.environ.get("ASI1_MODEL", "asi1")
+AGENT_NAME = os.environ.get("AGENT_NAME", "tonights-pick")
 AGENT_SEED = os.environ.get("AGENT_SEED", "tonights-pick-agent-seed-v1")
 AGENT_PORT = int(os.environ.get("AGENT_PORT", 8001))
 
@@ -463,13 +478,34 @@ Rules:
 # ---------------------------------------------------------------------------
 
 agent = Agent(
-    name="tonights-pick",
+    name=AGENT_NAME,
     seed=AGENT_SEED,
     port=AGENT_PORT,
     mailbox=True,
+    agentverse=os.environ.get("AGENTVERSE_URL", "https://agentverse.ai"),
+    handle_messages_concurrently=True,
+    mark_inactive_on_shutdown=False,
+    shutdown_timeout=int(os.environ.get("TERMINATION_GRACE_PERIOD_SECONDS", "60")),
 )
 
 fund_agent_if_low(agent.wallet.address())
+
+
+@agent.on_event("startup")
+async def startup(ctx: Context) -> None:
+    asyncio.create_task(start_health_server())
+
+    agent_address = str(ctx.address) if hasattr(ctx, "address") else str(agent.wallet.address())
+    ctx.logger.info(f"Tonight's Pick Agent started: {agent_address}")
+
+    init_sentry(
+        agent_name=AGENT_NAME,
+        agent_address=agent_address,
+        environment=os.environ.get("SENTRY_ENVIRONMENT"),
+    )
+
+    mark_ready()
+
 
 chat_proto = Protocol(spec=chat_protocol_spec)
 
@@ -489,35 +525,39 @@ You can also:
 # ---------------------------------------------------------------------------
 
 
-def _load_state(ctx: Context) -> dict:
+async def _load_state(ctx: Context, sender: str) -> dict:
+    p = f"{sender}:"
+    watchlist_titles = await get_watchlist(sender)
+    seen = await get_seen_titles(sender)
     return {
-        "vibe": ctx.storage.get("vibe") or "",
-        "vibe2": ctx.storage.get("vibe2") or "",
-        "who": ctx.storage.get("who") or "",
-        "reference": ctx.storage.get("reference") or "",
-        "rejections": json.loads(ctx.storage.get("rejections") or "[]"),
-        "history": json.loads(ctx.storage.get("history") or "[]"),
-        "media_type": ctx.storage.get("media_type") or "movie",
-        "max_runtime": ctx.storage.get("max_runtime"),
-        "watchlist": json.loads(ctx.storage.get("watchlist") or "[]"),
-        "seen_titles": json.loads(ctx.storage.get("seen_titles") or "[]"),
-        "last_reply": ctx.storage.get("last_reply") or "",
+        "vibe": ctx.storage.get(f"{p}vibe") or "",
+        "vibe2": ctx.storage.get(f"{p}vibe2") or "",
+        "who": ctx.storage.get(f"{p}who") or "",
+        "reference": ctx.storage.get(f"{p}reference") or "",
+        "rejections": json.loads(ctx.storage.get(f"{p}rejections") or "[]"),
+        "history": json.loads(ctx.storage.get(f"{p}history") or "[]"),
+        "media_type": ctx.storage.get(f"{p}media_type") or "movie",
+        "max_runtime": ctx.storage.get(f"{p}max_runtime"),
+        "watchlist": [{"title": t} for t in watchlist_titles],
+        "seen_titles": seen,
+        "last_reply": ctx.storage.get(f"{p}last_reply") or "",
     }
 
 
-def _save_state(ctx: Context, state: dict) -> None:
-    ctx.storage.set("vibe", state["vibe"])
-    ctx.storage.set("vibe2", state["vibe2"])
-    ctx.storage.set("who", state["who"])
-    ctx.storage.set("reference", state["reference"])
-    ctx.storage.set("rejections", json.dumps(state["rejections"]))
-    ctx.storage.set("history", json.dumps(state["history"]))
-    ctx.storage.set("media_type", state["media_type"])
+async def _save_state(ctx: Context, sender: str, state: dict) -> None:
+    p = f"{sender}:"
+    ctx.storage.set(f"{p}vibe", state["vibe"])
+    ctx.storage.set(f"{p}vibe2", state["vibe2"])
+    ctx.storage.set(f"{p}who", state["who"])
+    ctx.storage.set(f"{p}reference", state["reference"])
+    ctx.storage.set(f"{p}rejections", json.dumps(state["rejections"]))
+    ctx.storage.set(f"{p}history", json.dumps(state["history"]))
+    ctx.storage.set(f"{p}media_type", state["media_type"])
     if state["max_runtime"] is not None:
-        ctx.storage.set("max_runtime", state["max_runtime"])
-    ctx.storage.set("watchlist", json.dumps(state["watchlist"]))
-    ctx.storage.set("seen_titles", json.dumps(state["seen_titles"]))
-    ctx.storage.set("last_reply", state["last_reply"])
+        ctx.storage.set(f"{p}max_runtime", state["max_runtime"])
+    ctx.storage.set(f"{p}last_reply", state["last_reply"])
+    # Persist any seen_titles added inline by intake parsing
+    await bulk_add_seen_titles(sender, state["seen_titles"])
 
 
 # ---------------------------------------------------------------------------
@@ -912,20 +952,21 @@ def _handle_show_watchlist(state: dict) -> str:
     return "\n".join(lines)
 
 
-def _handle_save_watchlist(state: dict, user_text: str = "") -> str:
+async def _handle_save_watchlist(sender: str, state: dict, user_text: str = "") -> str:
     title = _extract_specific_title(user_text) if user_text else None
     if not title:
         return 'Tell me which title to save — e.g. "save The Dark Knight".'
-    already = [w["title"].lower() for w in state["watchlist"]]
-    if title.lower() not in already:
+    await add_to_watchlist(sender, title)
+    if not any(w["title"].lower() == title.lower() for w in state["watchlist"]):
         state["watchlist"].append({"title": title})
     current = ", ".join(w["title"] for w in state["watchlist"])
     return f"Saved {title} to your watchlist!\n\nCurrent watchlist: {current}"
 
 
-def _handle_add_seen(state: dict, user_text: str) -> str:
+async def _handle_add_seen(sender: str, state: dict, user_text: str) -> str:
     title = _extract_mark_seen_title(user_text)
     if title:
+        await add_seen_title(sender, title)
         if title.lower() not in [s.lower() for s in state["seen_titles"]]:
             state["seen_titles"].append(title)
         return f"Got it — I'll skip **{title}** in all future recommendations."
@@ -983,7 +1024,7 @@ async def on_chat_message(ctx: Context, sender: str, msg: ChatMessage) -> None:
     if not user_text:
         return
 
-    state = _load_state(ctx)
+    state = await _load_state(ctx, sender)
     state["history"].append({"role": "user", "content": user_text})
 
     # --- Special intent handling (watchlist / seen list) ---
@@ -991,28 +1032,28 @@ async def on_chat_message(ctx: Context, sender: str, msg: ChatMessage) -> None:
     if intent == "show_watchlist":
         reply = _handle_show_watchlist(state)
         state["history"].append({"role": "assistant", "content": reply})
-        _save_state(ctx, state)
+        await _save_state(ctx, sender, state)
         await ctx.send(sender, _make_chat_message(reply))
         return
 
     if intent == "save_watchlist":
-        reply = _handle_save_watchlist(state, user_text)
+        reply = await _handle_save_watchlist(sender, state, user_text)
         state["history"].append({"role": "assistant", "content": reply})
-        _save_state(ctx, state)
+        await _save_state(ctx, sender, state)
         await ctx.send(sender, _make_chat_message(reply))
         return
 
     if intent == "add_seen":
-        reply = _handle_add_seen(state, user_text)
+        reply = await _handle_add_seen(sender, state, user_text)
         state["history"].append({"role": "assistant", "content": reply})
-        _save_state(ctx, state)
+        await _save_state(ctx, sender, state)
         await ctx.send(sender, _make_chat_message(reply))
         return
 
     if intent == "show_seen":
         reply = _handle_show_seen(state)
         state["history"].append({"role": "assistant", "content": reply})
-        _save_state(ctx, state)
+        await _save_state(ctx, sender, state)
         await ctx.send(sender, _make_chat_message(reply))
         return
 
@@ -1026,7 +1067,7 @@ async def on_chat_message(ctx: Context, sender: str, msg: ChatMessage) -> None:
             f"Any {content_type} you loved recently?"
         )
         state["history"].append({"role": "assistant", "content": follow_up})
-        _save_state(ctx, state)
+        await _save_state(ctx, sender, state)
         await ctx.send(sender, _make_chat_message(follow_up))
         return
 
@@ -1035,7 +1076,7 @@ async def on_chat_message(ctx: Context, sender: str, msg: ChatMessage) -> None:
     state["last_reply"] = reply_text
     state["history"].append({"role": "assistant", "content": reply_text})
     outgoing = reply_text + FEATURE_HINT
-    _save_state(ctx, state)
+    await _save_state(ctx, sender, state)
 
     await ctx.send(sender, _make_chat_message(outgoing))
 

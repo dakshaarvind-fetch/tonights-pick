@@ -1,0 +1,20 @@
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: prod-v2-tonights-pick-agent
+  namespace: argocd
+spec:
+  project: innovation-labs-agents
+  sources:
+  - repoURL: http://charts.management.fetch-ai.com/
+    targetRevision: "0.5.3"
+    chart: base-chart
+    helm:
+      valueFiles:
+      - $values/deployment-v2/core/values/agents/values-tonights-pick-agent.yaml
+  - repoURL: "https://github.com/fetchai/agents-infra"
+    targetRevision: HEAD
+    ref: values
+  destination:
+    server: https://prodv2-ts-host.tail159d7.ts.net
+    namespace: agents

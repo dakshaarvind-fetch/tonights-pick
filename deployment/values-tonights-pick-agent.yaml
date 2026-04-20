@@ -1,0 +1,61 @@
+nameOverride: tonights-pick-agent
+namespace: agents
+terminationGracePeriodSeconds: 600
+image:
+  repository: gcr.io/fetch-ai-images/tonights-pick-agent
+  tag: ${IMAGE_TAG}
+configs:
+  AGENTVERSE_URL: "https://agentverse.ai"
+  AGENT_NAME: "tonights-pick-agent"
+  HEALTH_PORT: "8080"
+  AGENT_PORT: "8001"
+  AGENT_STATE_DIR: "/app/agents/tonights-pick-agent/.state"
+  REQUIRED_ENV_FOR_READY: "ASI_ONE_API_KEY"
+  ASI1_MODEL: "asi1"
+  SENTRY_ENABLED: "true"
+  SENTRY_ENVIRONMENT: "production"
+  SENTRY_TRACES_SAMPLE_RATE: "0.1"
+  SENTRY_TEST_ERROR: "false"
+  TERMINATION_GRACE_PERIOD_SECONDS: "300"
+  SHUTDOWN_TIMEOUT_SECONDS: "300"
+replicas: 2
+autoscaling:
+  enabled: true
+  minReplicas: 2
+  maxReplicas: 6
+  targetCPUUtilizationPercentage: 75
+  targetMemoryUtilizationPercentage: 75
+resources:
+  requests:
+    cpu: 200m
+    memory: 300Mi
+  limits:
+    cpu: 400m
+    memory: 800Mi
+podDisruptionBudget:
+  enabled: true
+  minAvailable: 1
+affinity:
+  podAntiAffinity:
+    keyValue: tonights-pick-agent
+    topologyKey: kubernetes.io/hostname
+    weight: 100
+strategy:
+  type: RollingUpdate
+  rollingUpdate:
+    maxSurge: 1
+    maxUnavailable: 0
+secrets:
+  secretStore: gcp-secret-store
+  key: tonights_pick_agent_es
+  data:
+    - name: AGENT_SEED
+      property: agentSeed
+    - name: ASI_ONE_API_KEY
+      property: asiOneApiKey
+    - name: TMDB_API_KEY
+      property: tmdbApiKey
+    - name: SENTRY_DSN
+      property: sentryDsn
+    - name: DATABASE_URL
+      property: databaseUrl
